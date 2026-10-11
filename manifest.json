@@ -1,0 +1,23 @@
+{
+	"id": "mcmod",
+	"name": "MC百科",
+	"version": "0.1.0",
+	"description": "MC百科（mcmod.cn）的模组与整合包。中文条目、中文简介，按分类浏览。目前仅提供浏览与检索：站点的下载需要人工通过验证码，所以这里不做安装，条目页与版本行提供前往本站的入口。",
+	"author": "Celestial",
+	"homepage": "https://github.com/Wemsur/Celestial-Content-Plugins",
+	"icon": "icon.png",
+	"color": "#86c155",
+	"detail_format": "markdown",
+	"api_version": 1,
+	"entry": "dist/index.js",
+	"content_types": ["mod", "modpack"],
+	"capabilities": {
+		"search": true,
+		"browse": true,
+		"detail": true,
+		"versions": false,
+		"resolve_download": false,
+		"update_check": false
+	},
+	"hosts": ["www.mcmod.cn", "search.mcmod.cn", "i.mcmod.cn"]
+}
