@@ -256,25 +256,105 @@ function openingParagraph(body: string | undefined): string | undefined {
 }
 
 export async function activate(api: ContentSourceApi) {
-	async function fetchDoc(url: string): Promise<Document> {
-		const response = await api.net.fetch(url, {
-			headers: { accept: 'text/html,application/xhtml+xml' },
+	/*
+	 * The site rate-limits hard, and it counts request *rate* rather than
+	 * anything about the client: four concurrent requests lose three, while one
+	 * every half second loses none. A browse page asks for several pages at once
+	 * — the sidebar's categories and the first listing — so unpaced it fails the
+	 * moment it opens, which is exactly what it did. Everything therefore goes
+	 * through one queue that keeps a gap between requests, and a page already
+	 * fetched is reused rather than asked for twice.
+	 */
+	const MIN_GAP_MS = 500
+	/** How long to hold off after the site answers 429. */
+	const RATE_LIMIT_COOLDOWN_MS = 2500
+	const MAX_ATTEMPTS = 2
+	const PAGE_TTL_MS = 60_000
+
+	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+	/** Pages already fetched, so the categories and the first listing share one request. */
+	const pageCache = new Map<string, { at: number; html: string }>()
+
+	/** The request queue: one at a time, `MIN_GAP_MS` apart. */
+	let queue: Promise<unknown> = Promise.resolve()
+	let lastRequestAt = 0
+
+	function schedule<T>(task: () => Promise<T>): Promise<T> {
+		const run = queue.then(async () => {
+			const gap = MIN_GAP_MS - (Date.now() - lastRequestAt)
+			if (gap > 0) await sleep(gap)
+			lastRequestAt = Date.now()
+			return task()
 		})
-		if (!response.ok) {
+		// The queue has to survive a rejected task, or one failure stalls every
+		// request behind it.
+		queue = run.then(
+			() => undefined,
+			() => undefined,
+		)
+		return run
+	}
+
+	/** One page, retrying once when the site's limiter asks us to slow down. */
+	async function requestHtml(url: string): Promise<string> {
+		for (let attempt = 1; ; attempt++) {
+			const response = await api.net.fetch(url, {
+				headers: { accept: 'text/html,application/xhtml+xml' },
+			})
+			if (response.ok) return response.body
+			if (response.status === 429 && attempt < MAX_ATTEMPTS) {
+				await sleep(RATE_LIMIT_COOLDOWN_MS)
+				// The retry stands in the queue's place, so the gap is measured from
+				// when it actually went out rather than from the refused attempt.
+				lastRequestAt = Date.now()
+				continue
+			}
 			throw new Error(`MC百科 ${response.status} ${url}`)
 		}
-		return new DOMParser().parseFromString(response.body, 'text/html')
+	}
+
+	async function fetchHtml(url: string): Promise<string> {
+		// The listings answer `?page=1` with the bare page, and the categories are
+		// read from that same bare page — so keying on the URL as written would ask
+		// the site for one page twice, which its rate limiter counts. Dropping a
+		// redundant `page=1` lets both callers share the one answer. The lookahead
+		// keeps `page=10` from being read as `page=1` plus a stray `0`.
+		const key = url
+			.replace(/([?&])page=1(?=&|$)&?/, '$1')
+			.replace(/[?&]$/, '')
+
+		const cached = pageCache.get(key)
+		if (cached && Date.now() - cached.at < PAGE_TTL_MS) return cached.html
+
+		return schedule(async () => {
+			// A queued duplicate may have filled the cache while this waited.
+			const again = pageCache.get(key)
+			if (again && Date.now() - again.at < PAGE_TTL_MS) return again.html
+			const html = await requestHtml(url)
+			const now = Date.now()
+			// Stale entries are dropped as new ones arrive, so paging through the
+			// catalogue does not grow the map for the life of the session.
+			for (const [entryKey, entry] of pageCache) {
+				if (now - entry.at >= PAGE_TTL_MS) pageCache.delete(entryKey)
+			}
+			pageCache.set(key, { at: now, html })
+			return html
+		})
+	}
+
+	async function fetchDoc(url: string): Promise<Document> {
+		return new DOMParser().parseFromString(await fetchHtml(url), 'text/html')
 	}
 
 	/**
-	 * Fetch several pages at once, keeping the ones that answered.
+	 * Fetch several pages, keeping the ones that answered.
 	 *
-	 * A browse with several categories ticked is several requests, and one of them
-	 * failing should not lose the others — the site is slow and rate-limits (429),
-	 * so a partial answer is the common case rather than the exceptional one. When
+	 * A browse with several categories ticked is several requests, and one of
+	 * them failing should not lose the others — the site rate-limits, so a
+	 * partial answer is a real possibility rather than a theoretical one. When
 	 * *every* request fails the error is rethrown, so the launcher reports the
-	 * source as failed instead of silently empty. Nothing is retried: the site's
-	 * limiter is not something to hammer at, and the launcher re-asks on its own.
+	 * source as failed instead of silently empty.
 	 */
 	async function fetchDocs(urls: string[]): Promise<Document[]> {
 		const settled = await Promise.allSettled(urls.map((url) => fetchDoc(url)))
