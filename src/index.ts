@@ -36,6 +36,7 @@ import type {
 	ContentProject,
 	ContentQuery,
 	ContentSourceApi,
+	ContentVersion,
 } from '@celestial/content-source'
 
 const SITE = 'https://www.mcmod.cn'
@@ -67,6 +68,16 @@ const MODPACK_LOADERS: Record<string, string> = {
 	rift: '6',
 	neoforge: '7',
 }
+
+/**
+ * The download page labels each file's loader with the same `download-api api-N`
+ * numbering the listing filters use, so this reads that number back into the
+ * loader name the launcher speaks. A mod's download page uses the mod numbering
+ * (NeoForge = 13), so the mod map is the one that applies here.
+ */
+const LOADER_BY_API: Record<string, string> = Object.fromEntries(
+	Object.entries(MOD_LOADERS).map(([name, api]) => [api, name]),
+)
 
 /** The site's own single-select filters that have no launcher equivalent. */
 const STATIC_GROUPS: Record<string, { id: string; header: string; options: ContentFilterOption[] }[]> = {
@@ -715,6 +726,96 @@ export async function activate(api: ContentSourceApi) {
 	}
 
 	/**
+	 * The download page's file table, one row per downloadable file.
+	 *
+	 * A mod's `/download/<id>.html` lists every file the site hosts for it — JEI
+	 * alone has 500 — each row carrying its md5, its game version, its file name
+	 * and suffix, and a `data-head` whose `download-api api-N` span names the
+	 * loader. The row's own md5 is the id the launcher passes back to
+	 * `openDownload`; there is no per-file URL, because the actual download needs
+	 * a captcha the user solves in a window.
+	 *
+	 * A mod with no download authorisation answers with an empty table, and one
+	 * with no `/download/` page at all (every modpack) has no rows to read — both
+	 * come back as no versions rather than an error.
+	 */
+	function versionsFromDoc(doc: Document): ContentVersion[] {
+		const rows = Array.from(doc.querySelectorAll('.download-table tbody tr'))
+		const versions: ContentVersion[] = []
+		for (const row of rows) {
+			const id = row.getAttribute('data-md5')
+			const stem = row.getAttribute('data-filename')
+			const suffix = row.getAttribute('data-suffix')
+			if (!id || !stem) continue
+			const api = row.getAttribute('data-head')?.match(/download-api api-(\d+)/)?.[1]
+			const loader = api ? LOADER_BY_API[api] : undefined
+			// The site prints a combined range like `1.21.1/1.21`, which the
+			// launcher's version filter expects as separate entries.
+			const gameVersions = (row.getAttribute('data-version') ?? '')
+				.split('/')
+				.map((value) => value.trim())
+				.filter(Boolean)
+			// The row's cells run 运行环境 / 文件名 / MC版本 / 大小 / 下载数 / 点赞 / 上传时间 / 操作.
+			// The size and download-count cells both keep their real number in a
+			// `data-original-title` tooltip, so they are read by position — by the
+			// like cell the number would be a like figure, not a download one.
+			const cells = Array.from(row.children)
+			const downloads = countFromTitle(cells[4]?.getAttribute('data-original-title'))
+			const publishedAt = timestampFromText(cells[6]?.getAttribute('data-original-title'))
+			versions.push({
+				id,
+				name: suffix ? `${stem}.${suffix}` : stem,
+				versionNumber: row.getAttribute('data-version') ?? undefined,
+				gameVersions,
+				loaders: loader ? [loader] : [],
+				channel: row.querySelector('.download-tags.tags-beta') ? 'beta' : undefined,
+				publishedAt,
+				downloads,
+			})
+		}
+		return versions
+	}
+
+	/**
+	 * Whether a download page carries no file at all.
+	 *
+	 * The site serves the same `/download/<id>.html` for a mod it has no file for:
+	 * instead of the table it prints 「…在MC百科内暂未得到下载授权或正在上传中。」
+	 * Downloadability is therefore decided by whether the page lists any file —
+	 * the same rows `versions` reads — and a page with none is refused rather
+	 * than opened, since a window onto that notice is a dead end the user cannot
+	 * act on.
+	 *
+	 * A page with no `.download-table` at all is *not* treated as empty: that
+	 * would misread every mod as undownloadable if the site ever renamed the
+	 * table, whereas the notice text is a stable thing to fall back on.
+	 */
+	function downloadUnavailable(doc: Document): boolean {
+		if (versionsFromDoc(doc).length > 0) return false
+		const table = doc.querySelector('.download-table')
+		if (table) return true
+		return (doc.body?.textContent ?? '').includes('暂未得到下载授权')
+	}
+
+	/**
+	 * The entry's versions, read from its download page.
+	 *
+	 * Only mods have one: a modpack has no site download at all, only links off
+	 * to where its author hosts it. Asking for a modpack's versions is therefore
+	 * an empty list rather than a wasted request.
+	 */
+	async function versions(id: string, request: ContentQuery): Promise<ContentVersion[]> {
+		if (sectionOf(request.contentType).kind !== 'class') return []
+		try {
+			const doc = await fetchDoc(`${SITE}/download/${encodeURIComponent(id)}.html`)
+			return versionsFromDoc(doc)
+		} catch (error) {
+			api.log(`读取 ${id} 的下载页失败：${String(error)}`)
+			return []
+		}
+	}
+
+	/**
 	 * The entry's own page, and the only place the site prints a count for it.
 	 *
 	 * `总浏览` — the page's total views — is the closest thing mcmod has to a
@@ -759,6 +860,10 @@ export async function activate(api: ContentSourceApi) {
 			loaders,
 			tags: [...new Set(tags)],
 			body,
+			// The page's outbound links. A modpack's usually include its CurseForge
+			// page, which the launcher recognizes and turns into a jump to the
+			// CurseForge source — that is how a catalogue-only entry becomes
+			// installable, without this source knowing anything about installing.
 			links: linksOf(doc, contentType, id),
 		}
 	}
@@ -783,5 +888,43 @@ export async function activate(api: ContentSourceApi) {
 		},
 
 		detail,
+		versions,
+
+		/**
+		 * mcmod's downloads sit behind a captcha, so the launcher cannot fetch a
+		 * file for the user — it opens the site's own download page instead and the
+		 * user completes the download there, as the site requires. Only mods have
+		 * such a page; a modpack's content lives elsewhere, so asking here is
+		 * refused with a pointer to the links that lead there.
+		 *
+		 * The page is read before the window opens, because many entries have no
+		 * file at all (「暂未得到下载授权或正在上传中」). Opening a window onto that
+		 * notice would strand the user in a dead end; refusing here, with a hint to
+		 * use the detail page's links, is an error the launcher shows like any
+		 * other install failure.
+		 */
+		async openDownload(
+			id: string,
+			contentType: string,
+			versionId?: string,
+		): Promise<{ url: string; fileName?: string }> {
+			if (sectionOf(contentType).kind !== 'class') {
+				throw new Error(
+					'这个整合包在 MC百科 上没有下载，请到详情页的「相关链接」里找它的发布页（通常是 CurseForge）安装。',
+				)
+			}
+			const url = `${SITE}/download/${encodeURIComponent(id)}.html`
+			const doc = await fetchDoc(url)
+			if (downloadUnavailable(doc)) {
+				throw new Error(
+					'这个模组在 MC百科 上暂时没有可下载的文件，请在详情页的「相关链接」里找它的发布页试试。',
+				)
+			}
+			// `versionId` is a file's md5. The page lists every file, so there is
+			// nothing to preselect — the user picks the row they want, which is the
+			// same freedom the site gives them.
+			void versionId
+			return { url }
+		},
 	})
 }

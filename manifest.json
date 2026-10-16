@@ -1,8 +1,8 @@
 {
 	"id": "mcmod",
 	"name": "MC百科",
-	"version": "0.1.0",
-	"description": "MC百科（mcmod.cn）的模组与整合包。中文条目、中文简介、按元素分类与官方状态筛选，正文与站外链接一并读取。目前仅提供浏览与检索：站点的下载需要人工通过验证码，所以这里不做安装，条目页提供前往本站的入口。",
+	"version": "0.2.0",
+	"description": "MC百科（mcmod.cn）的模组与整合包。中文条目、中文简介、按元素分类与官方状态筛选，正文与站外链接一并读取。模组可以安装：站点的下载需要人工过验证码，所以安装时会打开站点的下载页，由你在窗口里完成下载，启动器把下到的文件装进实例。整合包在站点没有下载，安装交给它页面上标注的 CurseForge 条目。",
 	"author": "Celestial",
 	"homepage": "https://github.com/Wemsur/celestial-content-mcmod",
 	"icon": "icon.png",
@@ -15,8 +15,9 @@
 		"search": true,
 		"browse": true,
 		"detail": true,
-		"versions": false,
+		"versions": true,
 		"resolve_download": false,
+		"open_download": true,
 		"update_check": false
 	},
 	"hosts": ["www.mcmod.cn", "search.mcmod.cn", "i.mcmod.cn"]
